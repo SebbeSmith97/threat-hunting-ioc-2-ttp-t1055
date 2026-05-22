@@ -1,0 +1,276 @@
+# Hunt T1055.001-H01 — Classical DLL injection via CreateRemoteThread + LoadLibrary
+
+---
+
+## Metadata
+
+| Field             | Value                                                              |
+|-------------------|--------------------------------------------------------------------|
+| Hunt ID           | T1055.001-H01                                                      |
+| MITRE technique   | T1055.001 — Process Injection: Dynamic-link Library Injection      |
+| MITRE tactic      | TA0005 — Defense Evasion / TA0004 — Privilege Escalation           |
+| Pyramid of Pain   | TTPs                                                               |
+| Hypothesis source | Mixed: Intelligence-driven + Domain expertise                      |
+| Author            | Sebastian Smith                                                    |
+| Version           | 1.2                                                                |
+| Last tested       | {2026-05-17} against Defender XDR Advanced Hunting                 |
+| Status            | Tested                                                             |
+
+---
+
+## 1. Hypothesis statement
+
+### Strategic hypothesis
+
+> If an attacker already has access to a system and wants to hide their malicious code inside
+> a legitimate process, they will need to plant that code from the outside and that act of
+> planting leaves a trace that can be traced as DLL Injection.
+
+This is the big-picture question the hunt is asking. It does not depend on knowing which tool
+the attacker used or which process they targeted. It just asks: did something write code into
+another process and make it run?
+
+---
+
+### Operational hypothesis
+
+> **If** classical DLL injection is performed, **then** within a short window on the same
+> device the same initiating process should exhibit:
+> - **(a)** cross-process memory writes into a remote process (`WriteProcessMemoryApiCall`
+>   in `DeviceEvents`), followed by
+> - **(b)** a remote thread creation targeting that same process
+>   (`CreateRemoteThreadApiCall` in `DeviceEvents`), followed by
+> - **(c)** a DLL load appearing in `DeviceImageLoadEvents` for the target process.
+>
+> This behaviour is durable because the API sequence — allocate, write, thread and load — is the
+> technique's definition. An adversary cannot evade this hunt without abandoning what
+> classical DLL injection's core fundaments.
+
+---
+
+### Telemetry
+
+| Table | ActionType | Stage in the injection chain |
+|---|---|---|
+| `DeviceEvents` | `WriteProcessMemoryApiCall` | Memory write — attacker writes DLL path into target process |
+| `DeviceEvents` | `CreateRemoteThreadApiCall` | Thread creation — attacker calls `LoadLibrary` in target |
+| `DeviceImageLoadEvents` | *(all rows for target process)* | Module load — injected DLL appears in target's address space |
+
+**Minimum retention required:** 7 days for the hunt window. 30 days if baselining is run first (recommended).
+
+---
+
+### MITRE ATT&CK mapping
+
+| Field | Value |
+|---|---|
+| Tactic | TA0005 — Defense Evasion |
+| Tactic | TA0004 — Privilege Escalation |
+| Technique | T1055 — Process Injection |
+| Sub-technique | T1055.001 — Dynamic-link Library Injection |
+| Detection reference | DET0389 — Process Injection: Injected Code |
+
+---
+
+## 2. Data requirements
+
+The telemetry sources and ActionTypes are listed in the **Telemetry** table in Section 1.
+This section adds the schema references and retention notes.
+
+**Schema references:**
+- [DeviceEvents](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-deviceevents-table)
+- [DeviceImageLoadEvents](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-deviceimageloadevents-table)
+
+---
+
+## 3. KQL query
+
+```kql
+// Hunt T1055.001-H01 — Classical DLL injection
+// Hypothesis: cross-process memory write + remote thread creation + image load
+// in the target process, all within a short window from the same initiator
+
+// Step 1 — cross-process memory writes (VirtualAllocEx + WriteProcessMemory)
+let cross_process_writes =
+    DeviceEvents
+    | where Timestamp > ago(7d)
+    | where ActionType == "WriteProcessMemoryApiCall"
+    | where InitiatingProcessId != ProcessId          // truly cross-process, not self-write
+    | project WriteTime = Timestamp,
+              DeviceId,
+              DeviceName,
+              WriterPid = InitiatingProcessId,
+              WriterFile = InitiatingProcessFileName,
+              WriterCommandLine = InitiatingProcessCommandLine,
+              TargetPid = ProcessId,
+              TargetFile = FileName;
+
+// Step 2 — correlate with remote thread creation in the same target (CreateRemoteThread)
+let with_remote_threads =
+    cross_process_writes
+    | join kind=inner (
+        DeviceEvents
+        | where Timestamp > ago(7d)
+        | where ActionType == "CreateRemoteThreadApiCall"
+        | project ThreadTime = Timestamp,
+                  DeviceId,
+                  WriterPid = InitiatingProcessId,
+                  TargetPid = ProcessId
+    ) on DeviceId, WriterPid, TargetPid
+    | where datetime_diff('second', ThreadTime, WriteTime) between (0 .. 60);  // same sequence window
+
+// Step 3 — correlate with subsequent image load in the target (LoadLibrary effect)
+let full_chain =
+    with_remote_threads
+    | join kind=inner (
+        DeviceImageLoadEvents
+        | where Timestamp > ago(7d)
+        | project LoadTime = Timestamp,
+                  DeviceId,
+                  TargetPid = InitiatingProcessId,
+                  LoadedFile = FileName,
+                  FolderPath,
+                  IsSigned,
+                  Signer
+    ) on DeviceId, TargetPid
+    | where datetime_diff('second', LoadTime, ThreadTime) between (0 .. 60);  // load follows thread
+
+// Step 4 — prevalence filter and aggregation per writer-target-DLL combination
+full_chain
+| summarize
+    Devices    = dcount(DeviceId),
+    Events     = count(),
+    FirstSeen  = min(WriteTime),
+    LastSeen   = max(LoadTime),
+    IsSigned   = take_any(IsSigned),
+    Signer     = take_any(Signer),
+    WriterCLI  = take_any(WriterCommandLine)
+    by WriterFile, TargetFile, LoadedFile, FolderPath
+| where Devices <= 5                                  // tune this threshold per tenant baseline
+| order by Devices asc, Events desc
+```
+
+**How to read this query:**
+
+- `| where ActionType == "WriteProcessMemoryApiCall"` — keeps only rows where one process
+  wrote into another process's memory. This is the first step of classical DLL injection.
+- `| join kind=inner (...)` — links the memory-write events to thread-creation events that
+  happened within 60 seconds in the same process pair. This eliminates benign memory writers
+  who never create threads.
+- The second join adds the image-load event — the DLL actually appearing in the target. All
+  three events must occur in sequence for a row to appear in the output.
+- `dcount(DeviceId)` counts how many different machines show this writer→target→DLL
+  combination. Low device counts (≤ 5) suggest something rare and potentially targeted.
+  High device counts suggest something deployed widely — investigate separately.
+- `| order by Devices asc` surfaces the rarest combinations first.
+
+---
+
+## 4. Expected results and tuning
+
+### 4.1 Expected legitimate causes
+
+The three-step chain (write → thread → load) has a small but real set of legitimate causes:
+
+- **Endpoint security products** — some AV/EDR sensors inject their own DLLs into monitored
+  processes for hooking purposes. The writer process will be a well-known security vendor
+  binary (e.g. `MsMpEng.exe`, `SentinelAgent.exe`). Check the `WriterFile` and `Signer`
+  fields.
+- **Debuggers** — Visual Studio, WinDbg, and similar tools attach to processes and load
+  debugging DLLs. Typically only seen on developer workstations during business hours.
+- **IT management tooling** — some remote administration or monitoring agents use injection
+  for process instrumentation. These will have consistent `WriterFile` values across the
+  fleet and a high `Devices` count.
+- **Software that loads plugins into host processes** — some legitimate applications (audio
+  software, productivity tools) use this pattern for plugin loading. Will appear as a
+  consistent writer→target pair with a signed `Signer`.
+
+### 4.2 Suggested triage refinements
+
+- **If** `IsSigned = 1` and `Signer` is a recognized software vendor and `Devices` is high:
+  investigate whether this is known-good tooling before escalating.
+- **If** `WriterFile` is a security product process name from your environment's allow-list:
+  deprioritize. Document the allow-list pattern per tenant rather than adding suppression
+  to the base query.
+- **If** the activity occurs on a developer workstation during business hours and `WriterFile`
+  is a known IDE: treat as lower priority.
+- **If** `IsSigned = 0` (unsigned loaded DLL): treat as higher priority regardless of other
+  factors.
+- **If** `TargetFile` is a high-value process (`lsass.exe`, `svchost.exe`, `explorer.exe`,
+  browser processes): treat as higher priority.
+- **If** `WriterCommandLine` contains encoded strings, unusual paths, or scripting-engine
+  invocations: treat as high priority.
+
+### 4.3 What a true positive looks like
+
+A malicious result typically shows an unusual `WriterFile` (a scripting engine, a
+recently-dropped binary, a process running from a temp or user-writable path) writing into
+a stable system process (`explorer.exe`, `svchost.exe`) at an unexpected time. The loaded
+`FolderPath` will often be a temp directory, a user's `AppData`, or a path not associated
+with the installed software implied by the DLL name. The `Signer` field will be empty or
+will not match the expected publisher for that DLL name. Follow-on network activity from
+the target process shortly after the load is a strong confirming signal.
+
+### 4.4 Recommended pivots
+
+- **Pivot 1 — Loaded DLL details:**
+  ```kql
+  DeviceImageLoadEvents
+  | where DeviceName == "{DeviceName from result}"
+  | where InitiatingProcessId == {TargetPid from result}
+  | where Timestamp between (datetime({LoadTime}) .. datetime_add('minute', 5, datetime({LoadTime})))
+  | project Timestamp, FileName, FolderPath, SHA256, IsSigned, Signer, InitiatingProcessFileName
+  ```
+  Look for unsigned DLLs, unusual paths, or DLL names that do not match their expected signer.
+
+- **Pivot 2 — Outbound network from the target process:**
+  ```kql
+  DeviceNetworkEvents
+  | where DeviceName == "{DeviceName from result}"
+  | where InitiatingProcessId == {TargetPid from result}
+  | where Timestamp between (datetime({LoadTime}) .. datetime_add('minute', 30, datetime({LoadTime})))
+  | project Timestamp, RemoteIP, RemoteUrl, RemotePort, InitiatingProcessFileName
+  ```
+  New outbound connections from the injected process — especially to low-prevalence IPs or
+  on unusual ports — are a strong indicator of C2 activity.
+
+- **Pivot 3 — Child processes of the target:**
+  ```kql
+  DeviceProcessEvents
+  | where DeviceName == "{DeviceName from result}"
+  | where InitiatingProcessId == {TargetPid from result}
+  | where Timestamp between (datetime({LoadTime}) .. datetime_add('minute', 30, datetime({LoadTime})))
+  | project Timestamp, FileName, ProcessCommandLine, AccountName
+  ```
+  Shells (`cmd.exe`, `powershell.exe`), scripting engines, or reconnaissance tools spawned
+  by the injected process are high-confidence true-positive indicators.
+
+---
+
+## 6. Pyramid of Pain positioning
+
+**Declared level: TTPs**
+
+An adversary performing classical DLL injection cannot evade this hunt without abandoning
+the technique entirely. The three steps — write memory into a remote process, create a thread
+in that process, observe a module load in that process — are not optional implementation
+details. They are what the technique is. The specific DLL name changes; the specific target
+process changes; the tooling changes between campaigns. None of these changes affects
+detection because none of them appears as a filter in the query. The query filters on the
+API call sequence, not on any artifact the adversary can rotate cheaply. This is the
+operational meaning of "TTP-level detection" on the Pyramid of Pain.
+
+---
+
+## 7. References
+
+- **MITRE ATT&CK:** [T1055.001 — Process Injection: Dynamic-link Library Injection](https://attack.mitre.org/techniques/T1055/001/)
+- **MITRE procedure examples:** Multiple entries documented on the technique page including
+  G0016 (APT29 / Cobalt Strike), S0367 (Emotet), S0154 (Cobalt Strike), S0089 (BlackEnergy),
+  S1039 (Bumblebee), S0603 (Stuxnet).
+- **MITRE detection reference:** DET0389 — Process Injection: Injected Code.
+- **Picus Red Report 2026:** Picus Security. (2026). *The Red Report 2026: The Top Ten MITRE
+  ATT&CK Techniques.* Picus Labs.
+  https://www.picussecurity.com/resource/the-top-ten-mitre-attack-techniques
+- **Microsoft schema — DeviceEvents:** https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-deviceevents-table
+- **Microsoft schema — DeviceImageLoadEvents:** https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-deviceimageloadevents-table
