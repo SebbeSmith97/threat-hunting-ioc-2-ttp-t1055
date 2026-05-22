@@ -30,18 +30,17 @@ working in a MSSP.
 
 ## How to read an entry
 
-Each entry file has seven sections:
+Each entry file has six sections:
 
 | Section | What it contains |
 |---------|-----------------|
 | **Metadata** | Hunt ID, technique, tactic, Pyramid of Pain level, hypothesis source, author, version, status |
 | **1. Hypothesis statement** | The testable "if … then …" statement the hunt is built around |
-| **2. Background** | What the variant is, known adversary use, current relevance, defensive baseline |
-| **3. Data requirements** | Which telemetry the query relies on |
-| **4. KQL query** | The hunt query, annotated with comments explaining each filter's intent |
-| **5. Expected results and tuning** | Legitimate causes, triage refinements, what a true positive looks like, recommended pivots |
-| **6. Pyramid of Pain positioning** | Why this entry sits at its declared level and what an adversary would have to change to evade it |
-| **7. References (if available)** | MITRE, CTI, schema documentation, community sources |
+| **2. Data requirements** | Which telemetry the query relies on |
+| **3. KQL query** | The hunt query, annotated with comments explaining each filter's intent |
+| **4. Expected results and tuning** | Legitimate causes, triage refinements, what a true positive looks like, recommended pivots |
+| **5. Pyramid of Pain positioning** | Why this entry sits at its declared level and what an adversary would have to change to evade it |
+| **6. References (if available)** | MITRE, CTI, schema documentation, community sources |
 
 ---
 
