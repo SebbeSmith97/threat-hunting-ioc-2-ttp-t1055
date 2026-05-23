@@ -52,7 +52,7 @@ another process and make it run?
 
 | Table | ActionType | Stage in the injection chain |
 |---|---|---|
-| `DeviceEvents` | `WriteProcessMemoryApiCall` | Memory write — attacker writes DLL path into target process |
+| `DeviceEvents` | `NtAllocateVirtualMemoryRemoteApiCall` | Logs when a program calls the Windows API to write into another process's memory space |
 | `DeviceEvents` | `CreateRemoteThreadApiCall` | Thread creation — attacker calls `LoadLibrary` in target |
 | `DeviceImageLoadEvents` | *(all rows for target process)* | Module load — injected DLL appears in target's address space |
 
@@ -90,11 +90,11 @@ This section adds the schema references and retention notes.
 // Hypothesis: cross-process memory write + remote thread creation + image load
 // in the target process, all within a short window from the same initiator
 
-// Step 1 — cross-process memory writes (VirtualAllocEx + WriteProcessMemory)
+// Step 1 — cross-process memory writes (VirtualAllocEx + NtAllocateVirtualMemoryRemoteApiCall)
 let cross_process_writes =
     DeviceEvents
     | where Timestamp > ago(7d)
-    | where ActionType == "WriteProcessMemoryApiCall"
+    | where ActionType == "NtAllocateVirtualMemoryRemoteApiCall"
     | where InitiatingProcessId != ProcessId          // truly cross-process, not self-write
     | project WriteTime = Timestamp,
               DeviceId,
@@ -104,7 +104,6 @@ let cross_process_writes =
               WriterCommandLine = InitiatingProcessCommandLine,
               TargetPid = ProcessId,
               TargetFile = FileName;
-
 // Step 2 — correlate with remote thread creation in the same target (CreateRemoteThread)
 let with_remote_threads =
     cross_process_writes
@@ -118,7 +117,6 @@ let with_remote_threads =
                   TargetPid = ProcessId
     ) on DeviceId, WriterPid, TargetPid
     | where datetime_diff('second', ThreadTime, WriteTime) between (0 .. 60);  // same sequence window
-
 // Step 3 — correlate with subsequent image load in the target (LoadLibrary effect)
 let full_chain =
     with_remote_threads
@@ -129,12 +127,9 @@ let full_chain =
                   DeviceId,
                   TargetPid = InitiatingProcessId,
                   LoadedFile = FileName,
-                  FolderPath,
-                  IsSigned,
-                  Signer
+                  FolderPath
     ) on DeviceId, TargetPid
     | where datetime_diff('second', LoadTime, ThreadTime) between (0 .. 60);  // load follows thread
-
 // Step 4 — prevalence filter and aggregation per writer-target-DLL combination
 full_chain
 | summarize
@@ -142,8 +137,6 @@ full_chain
     Events     = count(),
     FirstSeen  = min(WriteTime),
     LastSeen   = max(LoadTime),
-    IsSigned   = take_any(IsSigned),
-    Signer     = take_any(Signer),
     WriterCLI  = take_any(WriterCommandLine)
     by WriterFile, TargetFile, LoadedFile, FolderPath
 | where Devices <= 5                                  // tune this threshold per tenant baseline
