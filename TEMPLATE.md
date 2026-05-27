@@ -1,12 +1,10 @@
 # Hunt {T1003.001-Hnn} — {Short descriptive title of the variant}
 
-<!--
 Instructions:
   1. Copy this file. Rename it after the Hunt ID, e.g. T1055.001-H01_classical-dll-injection.md
   2. Replace every {placeholder} with content.
   3. If a section does not apply, write "Not applicable — {reason}" rather than deleting the section.
   5. Delete this comment block before publishing.
--->
 
 ---
 
